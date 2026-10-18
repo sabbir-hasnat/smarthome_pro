@@ -1,5 +1,5 @@
 name: smarthome_pro
-description: "A new Flutter project."
+description: "A smart-home Flutter application for ESP32 devices."
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -9,8 +9,10 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  intl: ^0.20.2
   cupertino_icons: ^1.0.8
-  
   flutter_blue_plus: ^2.3.14
   mqtt_client: ^10.13.0
   shared_preferences: ^2.5.6
@@ -23,3 +25,4 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  generate: true

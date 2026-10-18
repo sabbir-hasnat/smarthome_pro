@@ -51,14 +51,14 @@ bool bleClientConnected = false;
 // Dynamic Device Identity & Topics
 String deviceId       = "";
 String devicePin      = "123456"; // Default Login PIN
-String wifiSsid       = "Naim's Castle";
-String wifiPass       = "Naim2024&";
+String wifiSsid       = "";
+String wifiPass       = "";
 
 // [HIVEMQ CLOUD NEW] আপনার ব্রোকার URL, Port এবং Credentials
-String mqttServer     = "7a7203efca2c48c89965d15b72a122e4.s1.eu.hivemq.cloud";
-int    mqttPort       = 8883;
-String mqttUser       = "SmartHome Tech BD"; // এখানে আপনার HiveMQ Username দিন
-String mqttPass       = "Sabbir123456@"; // এখানে আপনার HiveMQ Password দিন
+String mqttServer     = "broker.hivemq.com";
+int    mqttPort       = 1883;
+String mqttUser       = "";
+String mqttPass       = "";
 
 String topicCommand      = ""; // iot/smarthome/<DEVICE_ID>/cmd
 String topicState        = ""; // iot/smarthome/<DEVICE_ID>/state
@@ -104,6 +104,10 @@ void loadSavedConfiguration() {
   devicePin  = prefs.getString("pin", "123456");
   wifiSsid   = prefs.getString("ssid", wifiSsid);
   wifiPass   = prefs.getString("pass", wifiPass);
+  mqttServer = prefs.getString("mqtt_srv", mqttServer);
+  mqttPort   = prefs.getInt("mqtt_port", mqttPort);
+  mqttUser   = prefs.getString("mqtt_user", mqttUser);
+  mqttPass   = prefs.getString("mqtt_pass", mqttPass);
   
   digitalWrite(PIN_RELAY_LIGHT, lightState ? RELAY_ON : RELAY_OFF);
   digitalWrite(PIN_RELAY_FAN,   fanState   ? RELAY_ON : RELAY_OFF);
@@ -241,8 +245,35 @@ void handleIncomingJson(String rawPayload, String channel) {
       sendResponseMessage("OK", "WiFi Updated. Reconnecting...");
       WiFi.disconnect();
       WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    } else {
+      sendResponseMessage("ERROR", "SSID can not be empty");
     }
   } 
+  else if (cmd == "set_mqtt") {
+    String newServer = doc["server"] | "";
+    int newPort      = doc["port"] | mqttPort;
+    String newUser   = doc["user"] | "";
+    String newPass   = doc["password"] | "";
+
+    if (newServer.length() == 0 || newPort < 1 || newPort > 65535) {
+      sendResponseMessage("ERROR", "Invalid MQTT configuration");
+      return;
+    }
+
+    mqttServer = newServer;
+    mqttPort   = newPort;
+    mqttUser   = newUser;
+    mqttPass   = newPass;
+
+    prefs.putString("mqtt_srv", mqttServer);
+    prefs.putInt("mqtt_port", mqttPort);
+    prefs.putString("mqtt_user", mqttUser);
+    prefs.putString("mqtt_pass", mqttPass);
+
+    mqttClient.setServer(mqttServer.c_str(), mqttPort);
+    sendResponseMessage("OK", "MQTT configuration updated");
+    mqttClient.disconnect();
+  }
   else if (cmd == "set_pin") {
     // Change Device Login Password/PIN
     String newPin = doc["new_pin"] | "";
@@ -332,6 +363,11 @@ void setupBLE() {
 // 9. WIFI & MQTT NON-BLOCKING MANAGEMENT
 // ==========================================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (length == 0 || length > 1024) {
+    sendResponseMessage("ERROR", "MQTT payload size invalid");
+    return;
+  }
+
   String msg = "";
   msg.reserve(length + 1);
   for (unsigned int i = 0; i < length; i++) {
@@ -346,6 +382,9 @@ void maintainConnections() {
   // 1. Check WiFi Connection every 10 seconds (Non-blocking)
   if (WiFi.status() != WL_CONNECTED) {
     digitalWrite(PIN_STATUS_LED, LOW);
+    if (wifiSsid.length() == 0) {
+      return;
+    }
     if (now - lastWifiRetry > 10000) {
       lastWifiRetry = now;
       Serial.println("[WiFi] Connecting to: " + wifiSsid);
@@ -364,7 +403,14 @@ void maintainConnections() {
       
       // Connect with Last Will and Testament (LWT) -> auto marks OFFLINE if power lost
       // [HIVEMQ CLOUD NEW] NULL, NULL এর বদলে mqttUser.c_str(), mqttPass.c_str() দেওয়া হয়েছে
-      if (mqttClient.connect(deviceId.c_str(), mqttUser.c_str(), mqttPass.c_str(), topicAvailability.c_str(), 1, true, "OFFLINE")) {
+      bool mqttConnected = false;
+      if (mqttUser.length() > 0) {
+        mqttConnected = mqttClient.connect(deviceId.c_str(), mqttUser.c_str(), mqttPass.c_str(), topicAvailability.c_str(), 1, true, "OFFLINE");
+      } else {
+        mqttConnected = mqttClient.connect(deviceId.c_str(), topicAvailability.c_str(), 1, true, "OFFLINE");
+      }
+
+      if (mqttConnected) {
         Serial.println("[MQTT] Connected!");
         mqttClient.publish(topicAvailability.c_str(), "ONLINE", true);
         mqttClient.subscribe(topicCommand.c_str());
@@ -414,9 +460,15 @@ void setup() {
 
   // Start WiFi & MQTT
   WiFi.mode(WIFI_STA);
-  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  if (wifiSsid.length() > 0) {
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  } else {
+    Serial.println("[WiFi] SSID not configured. Waiting for set_wifi command.");
+  }
   
-  espClient.setInsecure(); // [HIVEMQ CLOUD NEW] TLS connection without root certificate
+  if (mqttPort == 8883) {
+    espClient.setInsecure();
+  }
   
   mqttClient.setServer(mqttServer.c_str(), mqttPort);
   mqttClient.setBufferSize(1024); // Essential for full JSON payloads
