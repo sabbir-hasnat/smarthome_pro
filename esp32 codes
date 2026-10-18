@@ -1,0 +1,428 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h> // [HIVEMQ CLOUD NEW] Port 8883 (TLS/SSL) এর জন্য যুক্ত করা হয়েছে
+#include <PubSubClient.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// ==========================================
+// 1. INDUSTRIAL METADATA & PRODUCT INFO
+// ==========================================
+#define MANUFACTURER_NAME   "SmartHome Tech BD"
+#define DEVICE_MODEL        "SHN-2CH-PRO"
+#define HARDWARE_VERSION    "HW-v1.2.0"
+#define FIRMWARE_VERSION    "FW-v2.4.0-PROD"
+#define MANUFACTURE_DATE    "2026-10-15"
+#define RELEASE_DATE        "2026-10-17"
+#define BUILD_TIMESTAMP     __DATE__ " " __TIME__
+
+// ==========================================
+// 2. HARDWARE PIN CONFIGURATION
+// ==========================================
+const int PIN_RELAY_LIGHT = 26; // IN1 -> Light
+const int PIN_RELAY_FAN   = 27; // IN2 -> Fan
+const int PIN_STATUS_LED  = 2;  // Onboard Blue LED
+
+// Active LOW Relay Configuration (LOW = ON, HIGH = OFF)
+const int RELAY_ON  = LOW;
+const int RELAY_OFF = HIGH;
+
+// ==========================================
+// 3. BLE UUIDs (Custom Service + Characteristics)
+// ==========================================
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHAR_CMD_UUID       "beb5483e-36e1-4688-b7f5-ea07361b26a8" // Write (App -> ESP32)
+#define CHAR_STATE_UUID     "d4e5f6a7-47f2-5799-c8a6-fb18472c37b9" // Read & Notify (ESP32 -> App)
+
+// ==========================================
+// 4. GLOBAL VARIABLES & OBJECTS
+// ==========================================
+Preferences prefs;
+WiFiClientSecure espClient; // [HIVEMQ CLOUD NEW] WiFiClient এর বদলে WiFiClientSecure
+PubSubClient mqttClient(espClient);
+
+BLEServer* pServer = NULL;
+BLECharacteristic* pStateCharacteristic = NULL;
+bool bleClientConnected = false;
+
+// Dynamic Device Identity & Topics
+String deviceId       = "";
+String devicePin      = "123456"; // Default Login PIN
+String wifiSsid       = "Naim's Castle";
+String wifiPass       = "Naim2024&";
+
+// [HIVEMQ CLOUD NEW] আপনার ব্রোকার URL, Port এবং Credentials
+String mqttServer     = "7a7203efca2c48c89965d15b72a122e4.s1.eu.hivemq.cloud";
+int    mqttPort       = 8883;
+String mqttUser       = "SmartHome Tech BD"; // এখানে আপনার HiveMQ Username দিন
+String mqttPass       = "Sabbir123456@"; // এখানে আপনার HiveMQ Password দিন
+
+String topicCommand      = ""; // iot/smarthome/<DEVICE_ID>/cmd
+String topicState        = ""; // iot/smarthome/<DEVICE_ID>/state
+String topicAvailability = ""; // iot/smarthome/<DEVICE_ID>/availability
+
+// Device State
+bool lightState = false;
+bool fanState   = false;
+
+// Non-blocking Timers
+unsigned long lastWifiRetry     = 0;
+unsigned long lastMqttRetry     = 0;
+unsigned long lastTelemetryTime = 0;
+
+// Forward Declarations
+void publishDeviceState(String triggerSource);
+void sendResponseMessage(String status, String message);
+
+// ==========================================
+// 5. UNIQUE DEVICE ID & NVS STORAGE INIT
+// ==========================================
+void initDeviceIdentity() {
+  uint64_t mac = ESP.getEfuseMac();
+  char idBuf[16];
+  // Last 4 bytes of MAC address diye Unique ID generate
+  snprintf(idBuf, sizeof(idBuf), "SHN-%04X%04X", (uint16_t)(mac >> 32), (uint32_t)mac);
+  deviceId = String(idBuf);
+
+  // Dynamic MQTT Topics (No conflict across unlimited ESP32s)
+  topicCommand      = "iot/smarthome/" + deviceId + "/cmd";
+  topicState        = "iot/smarthome/" + deviceId + "/state";
+  topicAvailability = "iot/smarthome/" + deviceId + "/availability";
+}
+
+void loadSavedConfiguration() {
+  prefs.begin("smarthome", false);
+  
+  // Restore previous relay states after power cut
+  lightState = prefs.getBool("light", false);
+  fanState   = prefs.getBool("fan", false);
+  
+  // Load custom PIN & WiFi credentials if configured via App
+  devicePin  = prefs.getString("pin", "123456");
+  wifiSsid   = prefs.getString("ssid", wifiSsid);
+  wifiPass   = prefs.getString("pass", wifiPass);
+  
+  digitalWrite(PIN_RELAY_LIGHT, lightState ? RELAY_ON : RELAY_OFF);
+  digitalWrite(PIN_RELAY_FAN,   fanState   ? RELAY_ON : RELAY_OFF);
+}
+
+void applyRelayStates() {
+  digitalWrite(PIN_RELAY_LIGHT, lightState ? RELAY_ON : RELAY_OFF);
+  digitalWrite(PIN_RELAY_FAN,   fanState   ? RELAY_ON : RELAY_OFF);
+  
+  // Save in Non-Volatile Storage
+  prefs.putBool("light", lightState);
+  prefs.putBool("fan", fanState);
+}
+
+// ==========================================
+// 6. STATE & METADATA JSON BUILDER
+// ==========================================
+String buildStateJson(String source) {
+  JsonDocument doc;
+  
+  doc["device_id"]   = deviceId;
+  doc["source"]      = source;
+  doc["online"]      = true;
+  
+  // Relay Status
+  JsonObject state = doc["state"].to<JsonObject>();
+  state["light"] = lightState;
+  state["fan"]   = fanState;
+
+  // Device Metadata (Industrial Info)
+  JsonObject info = doc["info"].to<JsonObject>();
+  info["manufacturer"] = MANUFACTURER_NAME;
+  info["model"]        = DEVICE_MODEL;
+  info["hw_version"]   = HARDWARE_VERSION;
+  info["fw_version"]   = FIRMWARE_VERSION;
+  info["mfg_date"]     = MANUFACTURE_DATE;
+  info["release_date"] = RELEASE_DATE;
+  info["build_time"]   = BUILD_TIMESTAMP;
+
+  // Live Telemetry
+  JsonObject telemetry = doc["telemetry"].to<JsonObject>();
+  telemetry["uptime_sec"] = millis() / 1000;
+  telemetry["wifi_rssi"]  = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+  telemetry["ip"]         = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "0.0.0.0";
+  telemetry["free_heap"]  = ESP.getFreeHeap();
+
+  String output;
+  serializeJson(doc, output);
+  return output;
+}
+
+void publishDeviceState(String triggerSource) {
+  String payload = buildStateJson(triggerSource);
+
+  // 1. Send via BLE Notification (if phone is connected via BLE)
+  if (bleClientConnected && pStateCharacteristic != NULL) {
+    pStateCharacteristic->setValue(payload.c_str());
+    pStateCharacteristic->notify();
+  }
+
+  // 2. Publish to MQTT (Retained so newly logged-in app gets instant status)
+  if (mqttClient.connected()) {
+    mqttClient.publish(topicState.c_str(), payload.c_str(), true);
+  }
+  
+  Serial.println("[STATE SYNC] " + payload);
+}
+
+void sendResponseMessage(String status, String message) {
+  JsonDocument doc;
+  doc["device_id"] = deviceId;
+  doc["status"]    = status;
+  doc["message"]   = message;
+
+  String output;
+  serializeJson(doc, output);
+
+  if (bleClientConnected && pStateCharacteristic != NULL) {
+    pStateCharacteristic->setValue(output.c_str());
+    pStateCharacteristic->notify();
+  }
+  if (mqttClient.connected()) {
+    mqttClient.publish(topicState.c_str(), output.c_str(), false);
+  }
+}
+
+// ==========================================
+// 7. UNIFIED JSON COMMAND PROCESSOR
+// ==========================================
+void handleIncomingJson(String rawPayload, String channel) {
+  Serial.println("[" + channel + " RX] " + rawPayload);
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, rawPayload);
+  if (error) {
+    sendResponseMessage("ERROR", "Invalid JSON format");
+    return;
+  }
+
+  // 1. Authenticate Device PIN (Login Verification)
+  String incomingPin = doc["pin"] | "";
+  if (incomingPin != devicePin) {
+    Serial.println("[AUTH FAILED] Invalid PIN from " + channel);
+    sendResponseMessage("UNAUTHORIZED", "Invalid Device PIN!");
+    return;
+  }
+
+  String cmd = doc["cmd"] | "";
+
+  // 2. Command Routing
+  if (cmd == "login" || cmd == "get_status") {
+    // App Login successful -> return full device info & current relay states
+    publishDeviceState(channel + "_LOGIN");
+  } 
+  else if (cmd == "control") {
+    // Update Light & Fan state if present in JSON
+    if (!doc["light"].isNull()) {
+      lightState = doc["light"].as<bool>();
+    }
+    if (!doc["fan"].isNull()) {
+      fanState = doc["fan"].as<bool>();
+    }
+    applyRelayStates();
+    publishDeviceState(channel);
+  } 
+  else if (cmd == "set_wifi") {
+    // Dynamic WiFi Provisioning via App
+    String newSsid = doc["ssid"] | "";
+    String newPass = doc["pass"] | "";
+    if (newSsid.length() > 0) {
+      prefs.putString("ssid", newSsid);
+      prefs.putString("pass", newPass);
+      wifiSsid = newSsid;
+      wifiPass = newPass;
+      sendResponseMessage("OK", "WiFi Updated. Reconnecting...");
+      WiFi.disconnect();
+      WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    }
+  } 
+  else if (cmd == "set_pin") {
+    // Change Device Login Password/PIN
+    String newPin = doc["new_pin"] | "";
+    if (newPin.length() >= 4) {
+      devicePin = newPin;
+      prefs.putString("pin", devicePin);
+      sendResponseMessage("OK", "Device PIN updated successfully");
+    } else {
+      sendResponseMessage("ERROR", "PIN must be at least 4 characters");
+    }
+  } 
+  else if (cmd == "factory_reset") {
+    sendResponseMessage("OK", "Factory resetting device...");
+    delay(500);
+    prefs.clear();
+    ESP.restart();
+  } 
+  else if (cmd == "reboot") {
+    sendResponseMessage("OK", "Rebooting device...");
+    delay(500);
+    ESP.restart();
+  } 
+  else {
+    sendResponseMessage("ERROR", "Unknown command");
+  }
+}
+
+// ==========================================
+// 8. BLE SERVER & CALLBACKS
+// ==========================================
+class ServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    bleClientConnected = true;
+    Serial.println("[BLE] Client Connected");
+  }
+  void onDisconnect(BLEServer* pServer) {
+    bleClientConnected = false;
+    Serial.println("[BLE] Client Disconnected -> Restarting Advertising");
+    BLEDevice::startAdvertising();
+  }
+};
+
+class CommandCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    String rxValue = String(pCharacteristic->getValue().c_str());
+    rxValue.trim();
+    if (rxValue.length() > 0) {
+      handleIncomingJson(rxValue, "BLE");
+    }
+  }
+};
+
+void setupBLE() {
+  // BLE Name will be unique per device: e.g. "SHN-A1B2C3D4"
+  BLEDevice::init(deviceId.c_str());
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  // Command Characteristic (App writes JSON here)
+  BLECharacteristic *pCmdCharacteristic = pService->createCharacteristic(
+    CHAR_CMD_UUID,
+    BLECharacteristic::PROPERTY_WRITE
+  );
+  pCmdCharacteristic->setCallbacks(new CommandCallbacks());
+
+  // State Characteristic (App reads/subscribes for JSON updates here)
+  pStateCharacteristic = pService->createCharacteristic(
+    CHAR_STATE_UUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pStateCharacteristic->addDescriptor(new BLE2902());
+  pStateCharacteristic->setValue(buildStateJson("BOOT").c_str());
+
+  pService->start();
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  BLEDevice::startAdvertising();
+
+  Serial.println("[BLE] Advertising Started as: " + deviceId);
+}
+
+// ==========================================
+// 9. WIFI & MQTT NON-BLOCKING MANAGEMENT
+// ==========================================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg = "";
+  msg.reserve(length + 1);
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+  handleIncomingJson(msg, "MQTT");
+}
+
+void maintainConnections() {
+  unsigned long now = millis();
+
+  // 1. Check WiFi Connection every 10 seconds (Non-blocking)
+  if (WiFi.status() != WL_CONNECTED) {
+    digitalWrite(PIN_STATUS_LED, LOW);
+    if (now - lastWifiRetry > 10000) {
+      lastWifiRetry = now;
+      Serial.println("[WiFi] Connecting to: " + wifiSsid);
+      WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    }
+    return;
+  }
+
+  digitalWrite(PIN_STATUS_LED, HIGH); // Solid LED when WiFi Connected
+
+  // 2. Check MQTT Connection every 5 seconds (Non-blocking)
+  if (!mqttClient.connected()) {
+    if (now - lastMqttRetry > 5000) {
+      lastMqttRetry = now;
+      Serial.println("[MQTT] Attempting connection as " + deviceId + "...");
+      
+      // Connect with Last Will and Testament (LWT) -> auto marks OFFLINE if power lost
+      // [HIVEMQ CLOUD NEW] NULL, NULL এর বদলে mqttUser.c_str(), mqttPass.c_str() দেওয়া হয়েছে
+      if (mqttClient.connect(deviceId.c_str(), mqttUser.c_str(), mqttPass.c_str(), topicAvailability.c_str(), 1, true, "OFFLINE")) {
+        Serial.println("[MQTT] Connected!");
+        mqttClient.publish(topicAvailability.c_str(), "ONLINE", true);
+        mqttClient.subscribe(topicCommand.c_str());
+        publishDeviceState("MQTT_CONNECTED");
+      } else {
+        Serial.print("[MQTT] Failed, rc=");
+        Serial.println(mqttClient.state());
+      }
+    }
+  } else {
+    mqttClient.loop();
+  }
+
+  // 3. Periodic Heartbeat / Telemetry every 60 seconds
+  if (now - lastTelemetryTime > 60000) {
+    lastTelemetryTime = now;
+    publishDeviceState("HEARTBEAT");
+  }
+}
+
+// ==========================================
+// 10. MAIN SETUP & LOOP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(PIN_RELAY_LIGHT, OUTPUT);
+  pinMode(PIN_RELAY_FAN,   OUTPUT);
+  pinMode(PIN_STATUS_LED,  OUTPUT);
+
+  initDeviceIdentity();
+  loadSavedConfiguration();
+
+  Serial.println("\n==========================================");
+  Serial.println("  " + String(MANUFACTURER_NAME) + " - " + String(DEVICE_MODEL));
+  Serial.println("  Device ID     : " + deviceId);
+  Serial.println("  Firmware Ver  : " + String(FIRMWARE_VERSION));
+  Serial.println("  Hardware Ver  : " + String(HARDWARE_VERSION));
+  Serial.println("  Mfg Date      : " + String(MANUFACTURE_DATE));
+  Serial.println("  Release Date  : " + String(RELEASE_DATE));
+  Serial.println("  MQTT Cmd Topic: " + topicCommand);
+  Serial.println("==========================================\n");
+
+  // Start BLE First (Works immediately even without WiFi)
+  setupBLE();
+
+  // Start WiFi & MQTT
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  
+  espClient.setInsecure(); // [HIVEMQ CLOUD NEW] TLS connection without root certificate
+  
+  mqttClient.setServer(mqttServer.c_str(), mqttPort);
+  mqttClient.setBufferSize(1024); // Essential for full JSON payloads
+  mqttClient.setCallback(mqttCallback);
+}
+
+void loop() {
+  maintainConnections();
+}
